@@ -1,36 +1,90 @@
-Vagrant.configure("2") do |config|
-    config.vm.provision "shell", inline: <<-SHELL
-        apt-get update -y
-        echo "10.0.0.10  master-node" >> /etc/hosts
-        echo "10.0.0.11  worker-node01" >> /etc/hosts
-        echo "10.0.0.12  worker-node02" >> /etc/hosts
-    SHELL
-    
-    config.vm.define "master" do |master|
-      master.vm.box = "bento/ubuntu-18.04"
-      master.vm.hostname = "master-node"
-      master.vm.network "private_network", ip: "10.0.0.10"
-      master.vm.provider "virtualbox" do |vb|
-          vb.memory = 4048
-          vb.cpus = 2
-      end
-      master.vm.provision "shell", path: "scripts/common.sh"
-      master.vm.provision "shell", path: "scripts/master.sh"
-    end
+IMAGE_NAME = "bento/ubuntu-18.04"
 
-    (1..2).each do |i|
-  
-    config.vm.define "node0#{i}" do |node|
-      node.vm.box = "bento/ubuntu-18.04"
-      node.vm.hostname = "worker-node0#{i}"
-      node.vm.network "private_network", ip: "10.0.0.1#{i}"
-      node.vm.provider "virtualbox" do |vb|
-          vb.memory = 2048
-          vb.cpus = 1
-      end
-      node.vm.provision "shell", path: "scripts/common.sh"
-      node.vm.provision "shell", path: "scripts/node.sh"
-    end
-    
+K8S_MINOR_VERSION = "20"
+NETWORK_SUB = "192.168.60."
+START_IP = 120
+POD_CIDR = "10.#{K8S_MINOR_VERSION}.0.0/16"
+
+cluster = {
+  "master" => { :cpus => 2, :mem => 2048 },
+  "node" => { :cpus => 2, :mem => 2048 }
+}
+
+NODE_COUNT = 2
+
+VM_GROUP_NAME = "k8s-1.#{K8S_MINOR_VERSION}"
+DOCKER_VER = "5:19.03.15~3-0~ubuntu-bionic"
+KUBE_VER = "1.#{K8S_MINOR_VERSION}.14-00"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = IMAGE_NAME
+
+  config.vm.define "master", primary: true do |master|
+    master.vm.box = IMAGE_NAME
+    master.vm.network "private_network", ip: "#{NETWORK_SUB}#{START_IP}"
+    master.vm.hostname = "master"
+    master.vm.provision "kube", type: "shell", privileged: true, path: "scripts/kube.sh", env: {
+      "docker_ver" => "#{DOCKER_VER}",
+      "k8s_ver" => "#{KUBE_VER}"
+    }
+    master.vm.provision "0", type: "shell", preserve_order: true, privileged: true, inline: <<-SHELL
+      OUTPUT_FILE=/vagrant/join.sh
+      rm -rf /vagrant/join.sh
+      rm -rf /vagrant/.kube
+      sudo kubeadm init --apiserver-advertise-address=#{NETWORK_SUB}#{START_IP} --pod-network-cidr=#{POD_CIDR}
+      sudo kubeadm token create --print-join-command > /vagrant/join.sh
+      chmod +x $OUTPUT_FILE
+      mkdir -p $HOME/.kube
+      sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+      sudo chown $(id -u):$(id -g) $HOME/.kube/config
+      cp -R $HOME/.kube /vagrant/.kube
+      #kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      kubectl completion bash >/etc/bash_completion.d/kubect
+      echo 'alias k=kubectl' >>~/.bashrc
+    SHELL
+
+    master.vm.provision "file", preserve_order: true, source: "files", destination: "/tmp"
+    master.vm.provision "3", type: "shell", preserve_order: true, privileged: true, path: "scripts/pv.sh"
+
+    master.vm.provider "virtualbox" do |v|
+      v.name = "#{VM_GROUP_NAME}-master"
+      v.gui = false
+      v.memory = cluster['master'][:mem]
+      v.cpus = cluster['master'][:cpus]
+      v.customize ["modifyvm", :id, "--groups", "/#{VM_GROUP_NAME}"]
+      v.customize ["modifyvm", :id, "--vram", "9"]
+    end # end provider
+  end
+
+  (1..NODE_COUNT).each do |i|
+    config.vm.define "node-#{i}" do |node|
+      node.vm.box = IMAGE_NAME
+      node.vm.network "private_network", ip: "#{NETWORK_SUB}#{i + START_IP}"
+      node.vm.hostname = "node-#{i}"
+      node.vm.provision "kube", type: "shell", privileged: true, path: "scripts/kube.sh", env: {
+        "docker_ver" => "#{DOCKER_VER}",
+        "k8s_ver" => "#{KUBE_VER}"
+      }
+      node.vm.provision "shell-1", type: "shell", privileged: true, inline: <<-SHELL
+        sudo /vagrant/join.sh
+        sudo systemctl daemon-reload
+        sudo systemctl restart kubelet
+      SHELL
+      node.vm.provision "shell-2", type: "shell", privileged: true, inline: <<-SHELL
+        sudo echo 'Environment="KUBELET_EXTRA_ARGS=--node-ip=#{NETWORK_SUB}#{i + START_IP}"' >> /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        sudo systemctl daemon-reload
+        sudo systemctl restart kubelet
+      SHELL
+
+      node.vm.provider "virtualbox" do |v|
+        v.name = "#{VM_GROUP_NAME}-node-#{i}"
+        v.gui = false
+        v.memory = cluster['node'][:mem]
+        v.cpus = cluster['node'][:cpus]
+        v.customize ["modifyvm", :id, "--groups", "/#{VM_GROUP_NAME}"]
+        v.customize ["modifyvm", :id, "--vram", "9"]
+      end # end provider
     end
   end
+end
